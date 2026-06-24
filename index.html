@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Furesø Lake — 24-Hour Briefing (live)</title>
+
+<!-- Tailwind (Play CDN — the console "production" notice is informational only) -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- React + ReactDOM (jsDelivr UMD, CORS-enabled) -->
+<script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+
+<!-- Recharts 2.x (3.x ships NO UMD build — that was the original 404/CORS failure) -->
+<script crossorigin src="https://cdn.jsdelivr.net/npm/prop-types@15.8.1/prop-types.min.js"></script>
+<script crossorigin src="https://cdn.jsdelivr.net/npm/recharts@2.15.0/umd/Recharts.min.js"></script>
+
+<!-- Lucide icons (UMD build, pinned) -->
+<script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+
+<!-- Babel standalone for in-browser JSX -->
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.25.6/babel.min.js"></script>
+
+<style>
+  :root {
+    --bg: #f7fbff;
+    --navy: #0b3d91;
+    --wind: #1f6feb;
+    --gust: #7fb3ff;
+    --amber: #e07b1c;
+    --alert: #d9534f;
+    --green: #1e7a2e;
+    --muted: #5d6b7a;
+    --card-border: #dde6f0;
+  }
+  html, body { background: var(--bg); }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+                     Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+         color: #1d2733; }
+  .accent-left-navy { border-left: 4px solid var(--navy); }
+  .accent-left-green { border-left: 4px solid var(--green); }
+  .accent-left-amber { border-left: 4px solid var(--amber); }
+  .accent-left-alert { border-left: 4px solid var(--alert); }
+  .card { background: white; border: 1px solid var(--card-border); }
+  .heatmap-cell { font-variant-numeric: tabular-nums; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner { width: 28px; height: 28px; border: 3px solid #cfe2ff;
+             border-top-color: var(--wind); border-radius: 50%;
+             animation: spin .8s linear infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.35;} }
+  .live-dot { animation: pulse 2s ease-in-out infinite; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect } = React;
+const {
+  ResponsiveContainer, ComposedChart, Line, Area, Bar,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine,
+  BarChart
+} = window.Recharts;
+
+/* ====================================================================
+   LIVE DATA SOURCES (fetched in-browser, auto-refreshed every 15 min)
+
+   1) Weather — Open-Meteo Forecast API (free, no key, CORS-enabled).
+      Wind, gusts, direction, precip, cloud, temp, weather codes, sun.
+   2) Lake water temp — seatemperature.net (Furesø). That site has no
+      CORS, so we route it through a public CORS proxy (allorigins) and
+      parse the current value. If the proxy is slow/down we fall back to
+      the last value retrieved (16.7 °C, 22 Jun 2026) — clearly labelled,
+      never invented. Research-buoy data remains non-public.
+   ==================================================================== */
+const LAT = 55.79, LON = 12.42;
+const LOCATION = "Furesø (≈55.79°N, 12.42°E)";
+const REFRESH_MS = 15 * 60 * 1000; // 15 minutes
+
+const API =
+  "https://api.open-meteo.com/v1/forecast" +
+  "?latitude=" + LAT + "&longitude=" + LON +
+  "&hourly=temperature_2m,precipitation,precipitation_probability,cloud_cover," +
+  "wind_speed_10m,wind_gusts_10m,wind_direction_10m,weather_code" +
+  "&daily=sunrise,sunset" +
+  "&current=temperature_2m,wind_speed_10m,wind_gusts_10m,wind_direction_10m," +
+  "weather_code,precipitation,cloud_cover" +
+  "&wind_speed_unit=ms&timezone=Europe%2FCopenhagen&forecast_days=7";
+
+const WATER_PAGE = "https://da.seatemperature.net/soer/water-temp-in-lake-fureso";
+const PROXY = u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u);
+const WATER_FALLBACK = { temp: 16.7, asOf: "22 Jun 2026" }; // last value retrieved from seatemperature.net
+
+async function fetchWater() {
+  const res = await fetch(PROXY(WATER_PAGE), { cache: "no-store" });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const html = await res.text();
+  const m = html.match(/i dag er\s*([0-9]+(?:[.,][0-9]+)?)\s*°?\s*C/i)
+         || html.match(/Nuv[æae]rende vandtemperatur[\s\S]{0,40}?([0-9]+(?:[.,][0-9]+)?)\s*°?\s*C/i);
+  if (!m) throw new Error("could not parse temperature");
+  const v = parseFloat(m[1].replace(",", "."));
+  if (!isFinite(v) || v < -5 || v > 40) throw new Error("temperature out of range");
+  return v;
+}
+
+/* ---------------- helpers ---------------- */
+const r1 = x => Math.round(x * 10) / 10;
+const COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
+                 "S","SSW","SW","WSW","W","WNW","NW","NNW"];
+const degToCompass = d => COMPASS[Math.round((((d % 360) + 360) % 360) / 22.5) % 16];
+const THUNDER = new Set([95, 96, 99]);
+
+function fmtDay(dateStr) {
+  const d = new Date(dateStr + "T12:00:00");
+  return d.toLocaleDateString("en-GB", { weekday:"short", day:"numeric", month:"short" });
+}
+function fmtT(iso) {
+  return new Date(iso).toLocaleDateString("en-GB", { weekday:"short" }) + " " + iso.slice(11,16);
+}
+const fmtClock = iso => iso.slice(11,16);
+const fmtNow = dt => dt.toLocaleTimeString("en-GB", { hour:"2-digit", minute:"2-digit" });
+
+const SECTORS = COMPASS;
+const SPEED_BINS = [
+  { label: "0–2 m/s",  min: 0, max: 2,    color: "#cfe2ff" },
+  { label: "2–4 m/s",  min: 2, max: 4,    color: "#7fb3ff" },
+  { label: "4–6 m/s",  min: 4, max: 6,    color: "#1f6feb" },
+  { label: "6–8 m/s",  min: 6, max: 8,    color: "#0b3d91" },
+  { label: "8+ m/s",   min: 8, max: 999,  color: "#062569" },
+];
+function buildWindRose(obs) {
+  const grid = SECTORS.map(s => ({ sector: s,
+    "0–2 m/s":0,"2–4 m/s":0,"4–6 m/s":0,"6–8 m/s":0,"8+ m/s":0 }));
+  obs.forEach(({ deg, avg }) => {
+    const shifted = ((deg + 11.25) % 360 + 360) % 360;
+    const idx = Math.floor(shifted / 22.5) % 16;
+    const bin = SPEED_BINS.find(b => avg >= b.min && avg < b.max);
+    if (bin) grid[idx][bin.label] += 1;
+  });
+  const total = Math.max(obs.length, 1);
+  return grid.map(g => {
+    const out = { sector: g.sector };
+    SPEED_BINS.forEach(b => out[b.label] = +(g[b.label] / total * 100).toFixed(1));
+    return out;
+  });
+}
+
+/* sailing score (heuristic, fed by real data) */
+function scoreCell(w, g, p, l, h) {
+  let s = 100;
+  if      (w < 2) s -= 35;  else if (w < 4) s -= 10;
+  else if (w > 9) s -= 35;  else if (w > 7) s -= 15;
+  if      (g > 12) s -= 35; else if (g > 10) s -= 20; else if (g > 8) s -= 8;
+  if      (p > 2)   s -= 35; else if (p > 0.5) s -= 18; else if (p > 0.1) s -= 6;
+  if (l) s -= 60;
+  if (h < 6 || h > 20) s -= 15; else if (h < 8 || h > 19) s -= 5;
+  return Math.max(0, Math.min(100, s));
+}
+function scoreColor(s) {
+  const stops = [[0,[192,57,43]],[25,[230,126,34]],[50,[241,196,15]],
+                 [75,[167,227,161]],[100,[30,122,46]]];
+  for (let i = 0; i < stops.length - 1; i++) {
+    const [s1,c1] = stops[i], [s2,c2] = stops[i+1];
+    if (s >= s1 && s <= s2) {
+      const t = (s - s1) / (s2 - s1);
+      const c = c1.map((v,k) => Math.round(v + (c2[k]-v)*t));
+      return `rgb(${c[0]},${c[1]},${c[2]})`;
+    }
+  }
+  return "#999";
+}
+function cellMarkers(s, g, p, l) {
+  let m = "";
+  if (l) m += "⚡"; if (g > 10) m += "💨"; if (p > 0.5) m += "🌧"; if (s >= 85) m += "☀";
+  return m;
+}
+
+/* ---------------- transform weather payload ---------------- */
+function buildModel(d) {
+  const H = d.hourly, t = H.time;
+  const curHour = (d.current?.time || t[0]).slice(0,13);
+  let nowIdx = t.findIndex(x => x.slice(0,13) === curHour);
+  if (nowIdx < 0) nowIdx = t.findIndex(x => new Date(x) >= new Date(d.current?.time || t[0]));
+  if (nowIdx < 0) nowIdx = 0;
+
+  const next24 = [];
+  for (let k = 0; k < 24 && nowIdx + k < t.length; k++) {
+    const i = nowIdx + k;
+    next24.push({
+      iso: t[i], avg: H.wind_speed_10m[i], gust: H.wind_gusts_10m[i],
+      deg: H.wind_direction_10m[i], precip: H.precipitation[i],
+      prob: H.precipitation_probability ? H.precipitation_probability[i] : null,
+      cloud: H.cloud_cover[i], temp: H.temperature_2m[i], code: H.weather_code[i]
+    });
+  }
+  const wind24 = [], skyData = [];
+  for (let k = 0; k < next24.length; k += 3) {
+    const o = next24[k];
+    wind24.push({ t: fmtT(o.iso), avg: r1(o.avg), gust: r1(o.gust),
+                  dir: degToCompass(o.deg), deg: o.deg });
+    skyData.push({ t: fmtT(o.iso), precip: r1(o.precip), cloud: Math.round(o.cloud),
+                   temp: Math.round(o.temp) });
+  }
+  const windRoseData = buildWindRose(next24.map(o => ({ deg:o.deg, avg:o.avg })));
+
+  const idxByKey = new Map();
+  t.forEach((x,i) => idxByKey.set(x, i));
+  const HOURS = Array.from({length: 19}, (_, i) => i + 4);
+  const DAYS = (d.daily?.time || []).map(ds => ({ date: ds, label: fmtDay(ds) }));
+  function cell(dateStr, h) {
+    const key = dateStr + "T" + String(h).padStart(2,"0") + ":00";
+    const i = idxByKey.get(key);
+    if (i == null) return null;
+    return { w: H.wind_speed_10m[i], g: H.wind_gusts_10m[i],
+             p: H.precipitation[i], l: THUNDER.has(H.weather_code[i]) };
+  }
+
+  const gusts = next24.map(o => o.gust), avgs = next24.map(o => o.avg);
+  const maxGust = gusts.length ? Math.max(...gusts) : 0;
+  const meanAvg = avgs.length ? avgs.reduce((a,b)=>a+b,0)/avgs.length : 0;
+  const dirCounts = {};
+  next24.forEach(o => { const c = degToCompass(o.deg); dirCounts[c]=(dirCounts[c]||0)+1; });
+  const dominantDir = Object.entries(dirCounts).sort((a,b)=>b[1]-a[1])[0]?.[0] || "—";
+  const rainObj = next24.find(o => o.precip > 0.1 || (o.prob != null && o.prob >= 50));
+  const rainEta = rainObj ? fmtT(rainObj.iso) : null;
+  const thunder24 = next24.some(o => THUNDER.has(o.code));
+
+  const todayDate = t[nowIdx].slice(0,10);
+  let best = null, run = null;
+  for (const h of HOURS) {
+    const c = cell(todayDate, h);
+    const sc = c ? scoreCell(c.w, c.g, c.p, c.l, h) : 0;
+    if (sc >= 65) { run = run ? {...run, end:h} : {start:h, end:h};
+      if (!best || (run.end-run.start) > (best.end-best.start)) best = {...run}; }
+    else run = null;
+  }
+  const bestWindow = best ? `${String(best.start).padStart(2,"0")}–${String(best.end+1).padStart(2,"0")} today`
+                          : "limited today";
+
+  const thunderDays = DAYS.filter(dd => HOURS.some(h => { const c = cell(dd.date,h); return c && c.l; }))
+                          .map(dd => dd.label);
+  const sun = { rise: fmtClock(d.daily.sunrise[0]), set: fmtClock(d.daily.sunset[0]) };
+
+  return { nowIso: d.current?.time || t[nowIdx], cur: d.current,
+           wind24, skyData, windRoseData, DAYS, HOURS, cell,
+           maxGust, meanAvg, dominantDir, rainEta, thunder24, bestWindow,
+           thunderDays, sun };
+}
+
+/* ---------------- reusable bits ---------------- */
+function SectionTitle({ iconName, color, children, hint }) {
+  return (
+    <div className="flex items-center gap-2 mb-3">
+      <i data-lucide={iconName} style={{color}} className="w-5 h-5"></i>
+      <h2 className="text-lg font-semibold tracking-tight" style={{color}}>{children}</h2>
+      {hint && <span className="text-xs text-[color:var(--muted)] ml-auto">{hint}</span>}
+    </div>
+  );
+}
+function KPI({ icon, label, value, accent }) {
+  return (
+    <div className={`card rounded-lg p-4 ${accent}`}>
+      <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-[color:var(--muted)]">
+        <i data-lucide={icon} className="w-4 h-4"></i>{label}
+      </div>
+      <div className="mt-1 text-lg font-semibold text-[color:var(--navy)]">{value}</div>
+    </div>
+  );
+}
+
+/* ---------------- App ---------------- */
+function App() {
+  const [state, setState] = useState({ status:"loading" });
+  const [water, setWater] = useState({ status:"loading" });
+  const [sync,  setSync]  = useState(null);   // last successful weather sync
+  const [next,  setNext]  = useState(null);   // next scheduled refresh
+
+  useEffect(() => {
+    let alive = true;
+    const loadWeather = () =>
+      fetch(API, { cache:"no-store" })
+        .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+        .then(j => { if (alive) { setState({ status:"ok", model: buildModel(j) }); setSync(new Date()); } })
+        .catch(e => { if (alive) setState(s => s.status === "ok" ? s : { status:"error", err:e.message }); });
+    const loadWater = () =>
+      fetchWater()
+        .then(v => { if (alive) setWater({ status:"ok", temp:v, at:new Date() }); })
+        .catch(e => { if (alive) setWater({ status:"fallback", err:e.message, at:new Date() }); });
+
+    const run = () => { loadWeather(); loadWater(); setNext(new Date(Date.now() + REFRESH_MS)); };
+    run();
+    const id = setInterval(run, REFRESH_MS);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+
+  useEffect(() => {
+    if (window.lucide && window.lucide.createIcons) window.lucide.createIcons();
+  });
+
+  if (state.status === "loading") {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center gap-3 text-[color:var(--muted)]">
+        <div className="spinner"></div>
+        <div>Fetching live Furesø data…</div>
+      </div>
+    );
+  }
+  if (state.status === "error") {
+    return (
+      <div className="max-w-xl mx-auto mt-16 card accent-left-alert rounded-lg p-6">
+        <h1 className="text-lg font-bold" style={{color:"var(--alert)"}}>Couldn’t load live weather</h1>
+        <p className="text-sm mt-2 text-[color:var(--muted)]">
+          The page tried to fetch the Open-Meteo API but failed: <code>{state.err}</code>.
+          Check your internet connection — it will retry at the next 15-minute refresh, or reload now.
+        </p>
+      </div>
+    );
+  }
+
+  const m = state.model;
+  const issued = new Date(m.nowIso).toLocaleString("en-GB",
+    { weekday:"short", day:"numeric", month:"short", hour:"2-digit", minute:"2-digit" });
+  const cur = m.cur || {};
+
+  // water display
+  const waterLive = water.status === "ok";
+  const waterTemp = waterLive ? r1(water.temp) : WATER_FALLBACK.temp;
+  const waterKpi  = `${waterTemp} °C${waterLive ? "" : "*"}`;
+
+  const headline =
+    `${m.dominantDir} wind, averaging ~${r1(m.meanAvg)} m/s over the next 24 h. ` +
+    `Gusts to ~${r1(m.maxGust)} m/s${m.maxGust >= 10 ? " — watch exposed shorelines." : "."} ` +
+    (m.rainEta ? `Rain likely from ~${m.rainEta}.` : "No rain expected in the next 24 h.") +
+    (m.thunder24 ? " ⚡ Thundery risk in the window." : "");
+
+  return (
+    <div className="min-h-screen">
+      {/* Header */}
+      <header className="border-b border-[color:var(--card-border)] bg-white">
+        <div className="max-w-6xl mx-auto px-5 py-6">
+          <div className="flex items-start justify-between gap-4 flex-wrap">
+            <div>
+              <h1 className="text-2xl md:text-3xl font-bold tracking-tight" style={{color:"var(--navy)"}}>
+                🌊 Furesø Lake — 24-Hour Briefing
+              </h1>
+              <p className="text-sm text-[color:var(--muted)] mt-1">
+                Live · obs time <strong>{issued}</strong> · {LOCATION} · profile <strong>Sailing 🚤</strong>
+              </p>
+            </div>
+            <div className="text-xs text-[color:var(--muted)] text-right">
+              <div className="flex items-center gap-1 justify-end">
+                <span className="live-dot inline-block w-2 h-2 rounded-full" style={{background:"var(--green)"}}></span>
+                Auto-refresh every 15 min
+              </div>
+              <div>Updated {sync ? fmtNow(sync) : "—"}{next ? ` · next ~${fmtNow(next)}` : ""}</div>
+            </div>
+          </div>
+
+          {/* Current conditions strip */}
+          <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
+            <KPI icon="thermometer" label="Air now"
+                 value={`${r1(cur.temperature_2m)} °C`} accent="accent-left-amber" />
+            <KPI icon="wind" label="Wind now"
+                 value={`${r1(cur.wind_speed_10m)} m/s ${degToCompass(cur.wind_direction_10m)} · gust ${r1(cur.wind_gusts_10m)}`} accent="accent-left-navy" />
+            <KPI icon="sun" label="Sunrise / Sunset"
+                 value={`${m.sun.rise} / ${m.sun.set}`} accent="accent-left-amber" />
+            <KPI icon="droplets" label="Lake water temp"
+                 value={waterKpi} accent="accent-left-navy" />
+          </div>
+
+          {/* Headline */}
+          <div className="mt-4 card accent-left-green rounded-md p-4">
+            <div className="flex items-center gap-2">
+              <i data-lucide="sparkles" className="w-4 h-4" style={{color:"var(--green)"}}></i>
+              <span className="text-xs font-semibold uppercase tracking-wide" style={{color:"var(--green)"}}>Headline (auto-generated from live data)</span>
+            </div>
+            <p className="mt-1 text-[15px] leading-snug">{headline}</p>
+          </div>
+
+          {/* Derived KPIs */}
+          <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
+            <KPI icon="cloud-rain" label="Rain start ETA"
+                 value={m.rainEta || "None within 24 h"} accent="accent-left-navy" />
+            <KPI icon="navigation" label="Best sailing window"
+                 value={m.bestWindow} accent="accent-left-green" />
+            <KPI icon="gauge" label="Max gust (24 h)"
+                 value={`${r1(m.maxGust)} m/s`} accent={m.maxGust>=10?"accent-left-alert":"accent-left-navy"} />
+            <KPI icon="compass" label="Dominant direction"
+                 value={m.dominantDir} accent="accent-left-amber" />
+          </div>
+        </div>
+      </header>
+
+      {/* Body */}
+      <main className="max-w-6xl mx-auto px-5 py-6 space-y-6">
+
+        {/* Wind chart */}
+        <section className="card rounded-lg p-5">
+          <SectionTitle iconName="wind" color="var(--navy)" hint="next 24 h · 3-hourly">
+            Wind — speed, gust & direction
+          </SectionTitle>
+          <div style={{width:"100%", height:320}}>
+            <ResponsiveContainer>
+              <ComposedChart data={m.wind24} margin={{top:10,right:30,bottom:10,left:0}}>
+                <CartesianGrid stroke="#dde6f0" />
+                <XAxis dataKey="t" tick={{fontSize:11}} />
+                <YAxis domain={[0,"auto"]} unit=" m/s" tick={{fontSize:11}} />
+                <Tooltip />
+                <Legend wrapperStyle={{fontSize:12}} />
+                <Area type="monotone" dataKey="gust" stroke="none" fill="#cfe2ff" fillOpacity={0.9} name="Gust band" />
+                <Line type="monotone" dataKey="gust" stroke="#7fb3ff" strokeWidth={2} dot={{r:3}} name="Gust (m/s)" />
+                <Line type="monotone" dataKey="avg" stroke="#1f6feb" strokeWidth={2.5} dot={{r:4}} name="Average (m/s)" />
+                <ReferenceLine y={10} stroke="#d9534f" strokeDasharray="4 3"
+                  label={{value:"⚠ 10 m/s alert", fill:"#d9534f", fontSize:11, position:"insideTopRight"}} />
+                <ReferenceLine y={5.5} stroke="#9aa5b1" strokeDasharray="2 3"
+                  label={{value:"Bft 4", fill:"#5d6b7a", fontSize:10, position:"insideRight"}} />
+                <ReferenceLine y={8.0} stroke="#9aa5b1" strokeDasharray="2 3"
+                  label={{value:"Bft 5", fill:"#5d6b7a", fontSize:10, position:"insideRight"}} />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="mt-2 grid gap-1 text-center"
+               style={{gridTemplateColumns:`repeat(${m.wind24.length},minmax(0,1fr))`}}>
+            {m.wind24.map((w,i) => (
+              <div key={i} className="text-[11px]">
+                <div className="text-[color:var(--navy)] font-bold leading-none"
+                     style={{transform:`rotate(${(w.deg+180)%360}deg)`, display:"inline-block"}}>↑</div>
+                <div className="text-[color:var(--muted)]">{w.dir}</div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* Sky + Wind rose */}
+        <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className="card rounded-lg p-5">
+            <SectionTitle iconName="cloud-sun" color="var(--navy)" hint="next 24 h">Sky & temperature</SectionTitle>
+            <div style={{width:"100%", height:280}}>
+              <ResponsiveContainer>
+                <ComposedChart data={m.skyData} margin={{top:10,right:20,bottom:5,left:0}}>
+                  <CartesianGrid stroke="#dde6f0" />
+                  <XAxis dataKey="t" tick={{fontSize:11}} />
+                  <YAxis yAxisId="left" domain={[0,100]} tick={{fontSize:11}} unit=" %" />
+                  <YAxis yAxisId="right" orientation="right" domain={["auto","auto"]} tick={{fontSize:11}} unit=" °C" />
+                  <Tooltip />
+                  <Legend wrapperStyle={{fontSize:12}} />
+                  <Bar yAxisId="left" dataKey="precip" fill="#1f6feb" name="Precip (mm/h)" />
+                  <Area yAxisId="left" type="monotone" dataKey="cloud" stroke="#5d6b7a" fill="#b0bac4" fillOpacity={0.35} name="Cloud cover (%)" />
+                  <Line yAxisId="right" type="monotone" dataKey="temp" stroke="#e07b1c" strokeWidth={2.5} dot={{r:3}} name="Air temp (°C)" />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          <div className="card rounded-lg p-5">
+            <SectionTitle iconName="compass" color="var(--navy)" hint="next 24 h">Wind rose (direction FROM)</SectionTitle>
+            <div style={{width:"100%", height:280}}>
+              <ResponsiveContainer>
+                <BarChart data={m.windRoseData} layout="vertical" stackOffset="sign"
+                          margin={{top:5,right:20,bottom:5,left:30}}>
+                  <CartesianGrid stroke="#dde6f0" />
+                  <XAxis type="number" unit=" %" tick={{fontSize:11}} />
+                  <YAxis type="category" dataKey="sector" tick={{fontSize:11}} width={40} />
+                  <Tooltip />
+                  <Legend wrapperStyle={{fontSize:11}} />
+                  {SPEED_BINS.map(b => (<Bar key={b.label} dataKey={b.label} stackId="a" fill={b.color} />))}
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            <p className="mt-2 text-sm" style={{color:"var(--muted)"}}>
+              Dominant flow: <strong style={{color:"var(--navy)"}}>{m.dominantDir}</strong> over the next 24 h.
+            </p>
+          </div>
+        </section>
+
+        {/* Heatmap */}
+        <section className="card rounded-lg p-5">
+          <SectionTitle iconName="calendar-days" color="var(--navy)" hint="7-day outlook">Sailing-window heatmap</SectionTitle>
+          <div className="overflow-x-auto">
+            <table className="w-full text-center text-[11px] heatmap-cell">
+              <thead>
+                <tr>
+                  <th className="text-left pr-2 text-[color:var(--muted)] font-medium">Day</th>
+                  {m.HOURS.map(h => (
+                    <th key={h} className="px-1 py-1 text-[color:var(--muted)] font-medium">{String(h).padStart(2,"0")}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {m.DAYS.map(d => (
+                  <tr key={d.date}>
+                    <td className="text-left pr-2 py-1 font-semibold" style={{color:"var(--navy)"}}>{d.label}</td>
+                    {m.HOURS.map(h => {
+                      const c = m.cell(d.date, h);
+                      if (!c) return <td key={h} style={{background:"#eef2f6", minWidth:30, border:"2px solid var(--bg)"}}></td>;
+                      const s = scoreCell(c.w, c.g, c.p, c.l, h);
+                      const bg = scoreColor(s);
+                      const textCol = s < 30 || s > 80 ? "white" : "#1d2733";
+                      const mk = cellMarkers(s, c.g, c.p, c.l);
+                      return (
+                        <td key={h}
+                            title={`${d.label} ${h}:00 → score ${s} | wind ${r1(c.w)} m/s · gust ${r1(c.g)} m/s · precip ${r1(c.p)} mm/h${c.l?" · ⚡":""}`}
+                            style={{background:bg, color:textCol, padding:"4px 0", minWidth:30, border:"2px solid var(--bg)"}}>
+                          <div className="leading-none">
+                            <div className="font-semibold">{s}</div>
+                            {mk && <div style={{fontSize:9, lineHeight:1}}>{mk}</div>}
+                          </div>
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-[color:var(--muted)]">
+            <span>⚡ Lightning</span><span>💨 Gust &gt; 10 m/s</span>
+            <span>🌧 Rain &gt; 0.5 mm/h</span><span>☀ Ideal hour (≥ 85)</span>
+            <span className="ml-auto">Red 0 → Green 100</span>
+          </div>
+        </section>
+
+        {/* Water + Alerts */}
+        <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className="card rounded-lg p-5 accent-left-navy">
+            <SectionTitle iconName="droplets" color="var(--navy)"
+              hint={waterLive ? `live · ${water.at ? fmtNow(water.at) : ""}` : "last known"}>
+              Water (Furesø)
+            </SectionTitle>
+            <ul className="text-sm space-y-1.5">
+              <li>💧 <strong>Lake surface temp:</strong> {waterTemp} °C{" "}
+                {waterLive
+                  ? <span style={{color:"var(--green)"}}>· live (seatemperature.net)</span>
+                  : <span style={{color:"var(--amber)"}}>· last known {WATER_FALLBACK.asOf} (live fetch unavailable)</span>}
+              </li>
+              <li>🏊 <strong>Measured bathing water:</strong> badevandet.dk / Furesøbad meter (own measuring station).</li>
+              <li>🔬 <strong>Research buoy</strong> (SDU water-quality project): data not public — via Furesø Kommune / SDU.</li>
+              <li>🌊 <strong>Lake level / Mølleåen:</strong> not in this live feed.</li>
+            </ul>
+          </div>
+
+          <div className="card rounded-lg p-5 accent-left-alert">
+            <SectionTitle iconName="alert-triangle" color="var(--alert)">Alerts (live)</SectionTitle>
+            <ul className="text-sm space-y-1.5">
+              <li>{m.maxGust >= 10 ? "🌬 " : "🟢 "}<strong>Gusts:</strong> peak ~{r1(m.maxGust)} m/s in next 24 h{m.maxGust>=10?" — above 10 m/s, take care on exposed shores.":" — below 10 m/s threshold."}</li>
+              <li>{m.rainEta ? "🌧 " : "🟢 "}<strong>Rain:</strong> {m.rainEta ? `expected from ~${m.rainEta}.` : "none within 24 h."}</li>
+              <li>{m.thunder24 ? "⚡ " : "🟢 "}<strong>Thunder:</strong> {m.thunder24 ? "risk flagged within next 24 h." : "none signalled next 24 h."}</li>
+              <li>{m.thunderDays.length ? "⚠️ " : "🟢 "}<strong>7-day thundery days:</strong> {m.thunderDays.length ? m.thunderDays.join(", ") : "none in the 7-day window."}</li>
+            </ul>
+          </div>
+        </section>
+
+        {/* Sources */}
+        <footer className="text-xs text-[color:var(--muted)] pt-2 pb-8">
+          <div className="border-t border-[color:var(--card-border)] pt-3">
+            <strong>Live sources (auto-refreshed every 15 min):</strong> weather via Open-Meteo Forecast API
+            (free, no key; blends national models incl. DMI/ECMWF). Lake water temp via seatemperature.net,
+            read through the allorigins CORS proxy and parsed in-browser; if the proxy is unavailable the
+            panel shows the last known value ({WATER_FALLBACK.temp} °C, {WATER_FALLBACK.asOf}), marked with *.
+            <strong> Not live:</strong> SDU research-buoy data (non-public) and lake level. The sailing score
+            is a heuristic computed from the live wind/precip/thunder values.
+          </div>
+          <div className="mt-2">Single-file React dashboard (Tailwind + Recharts).</div>
+        </footer>
+      </main>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
